@@ -1,0 +1,4 @@
+fastai==0.7
+jupyterlab
+matplotlib
+seaborn
