@@ -80,7 +80,7 @@ class ItemList():
         return pred
 
     def reconstruct(self, t:Tensor, x:Tensor=None):
-        "Reconstuct one of the underlying item for its data `t`."
+        "Reconstruct one of the underlying item for its data `t`."
         return self[0].reconstruct(t,x) if has_arg(self[0].reconstruct, 'x') else self[0].reconstruct(t)
 
     def new(self, items:Iterator, processor:PreProcessor=None, **kwargs)->'ItemList':
@@ -88,6 +88,10 @@ class ItemList():
         processor = ifnone(processor, self.processor)
         copy_d = {o:getattr(self,o) for o in self.copy_new}
         return self.__class__(items=items, processor=processor, **copy_d, **kwargs)
+                
+    def add(self, items:'ItemList'): 
+        self.items = np.concatenate([self.items, items.items], 0)
+        return self
 
     def __getitem__(self,idxs:int)->Any:
         idxs = try_int(idxs)
@@ -206,16 +210,16 @@ class ItemList():
         valid_idx = np.where(self.xtra.iloc[:,df_names_to_idx(col, self.xtra)])[0]
         return self.split_by_idx(valid_idx)
 
-    def get_label_cls(self, labels, label_cls:Callable=None, sep:str=None, **kwargs):
+    def get_label_cls(self, labels, label_cls:Callable=None, label_delim:str=None, **kwargs):
         "Return `label_cls` or guess one from the first element of `labels`."
         if label_cls is not None:               return label_cls
         if self.label_cls is not None:          return self.label_cls
         it = index_row(labels,0)
-        if sep is not None:                     return MultiCategoryList
+        if label_delim is not None:             return MultiCategoryList
         if isinstance(it, (float, np.float32)): return FloatList
         if isinstance(try_int(it), (str,numbers.Integral)):  return CategoryList
         if isinstance(it, Collection):          return MultiCategoryList
-        return self.__class__
+        return ItemList #self.__class__
 
     def label_from_list(self, labels:Iterator, **kwargs)->'LabelList':
         "Label `self.items` with `labels`."
@@ -229,7 +233,7 @@ class ItemList():
         "Label `self.items` from the values in `cols` in `self.xtra`."
         labels = _maybe_squeeze(self.xtra.iloc[:,df_names_to_idx(cols, self.xtra)])
         assert labels.isna().sum().sum() == 0, f"You have NaN values in column(s) {cols} of your dataframe, please fix it." 
-        if is_listy(cols) and len(cols) > 1 and 'label_cls' not in kwargs: 
+        if is_listy(cols) and len(cols) > 1 and ('label_cls' not in kwargs or kwargs['label_cls'] == MultiCategoryList): 
             new_kwargs = dict(one_hot=True, label_cls=MultiCategoryList, classes= cols)
             kwargs = {**new_kwargs, **kwargs}
         return self.label_from_list(labels, **kwargs)
@@ -312,7 +316,7 @@ class CategoryListBase(ItemList):
 class CategoryList(CategoryListBase):
     "Basic `ItemList` for single classification labels."
     _processor=CategoryProcessor
-    def __init__(self, items:Iterator, classes:Collection=None, sep:str=None, **kwargs):
+    def __init__(self, items:Iterator, classes:Collection=None, label_delim:str=None, **kwargs):
         super().__init__(items, classes=classes, **kwargs)
         self.loss_func = CrossEntropyFlat()
 
@@ -339,7 +343,8 @@ class MultiCategoryProcessor(CategoryProcessor):
                 
     def process_one(self,item): 
         if self.one_hot or isinstance(item, EmptyLabel): return item
-        return [super(MultiCategoryProcessor, self).process_one(o) for o in item]
+        res = [super(MultiCategoryProcessor, self).process_one(o) for o in item]
+        return [r for r in res if r is not None]
 
     def generate_classes(self, items):
         "Generate classes from `items` by taking the sorted unique values."
@@ -352,8 +357,8 @@ class MultiCategoryProcessor(CategoryProcessor):
 class MultiCategoryList(CategoryListBase):
     "Basic `ItemList` for multi-classification labels."
     _processor=MultiCategoryProcessor
-    def __init__(self, items:Iterator, classes:Collection=None, sep:str=None, one_hot:bool=False, **kwargs):
-        if sep is not None: items = array(csv.reader(items.astype(str), delimiter=sep))
+    def __init__(self, items:Iterator, classes:Collection=None, label_delim:str=None, one_hot:bool=False, **kwargs):
+        if label_delim is not None: items = array(csv.reader(items.astype(str), delimiter=label_delim))
         super().__init__(items, classes=classes, **kwargs)
         if one_hot: 
             assert classes is not None, "Please provide class names with `classes=...`"
@@ -376,7 +381,7 @@ class MultiCategoryList(CategoryListBase):
         return MultiCategory(t, [self.classes[p] for p in o], o)
 
 class FloatList(ItemList):
-    "`ItemList` suitable for storing the floats in items for regression. Will add a `log` if thif flag is `True`."
+    "`ItemList` suitable for storing the floats in items for regression. Will add a `log` if this flag is `True`."
     def __init__(self, items:Iterator, log:bool=False, **kwargs):
         super().__init__(np.array(items, dtype=np.float32), **kwargs)
         self.log = log
@@ -503,13 +508,13 @@ class LabelLists(ItemLists):
     def load_state(cls, path:PathOrStr, state:dict):
         "Create a `LabelLists` with empty sets from the serialized `state`."
         path = Path(path)
-        train_ds = LabelList.load_state(state)
-        valid_ds = LabelList.load_state(state)
+        train_ds = LabelList.load_state(path, state)
+        valid_ds = LabelList.load_state(path, state)
         return LabelLists(path, train=train_ds, valid=valid_ds)
 
     @classmethod
     def load_empty(cls, path:PathOrStr, fn:PathOrStr='export.pkl'):
-        "Create a `LabelLists` with empty sets from the serialzed file in `path/fn`."      
+        "Create a `LabelLists` with empty sets from the serialized file in `path/fn`."      
         state = pickle.load(open(path/fn, 'rb'))
         return LabelLists.load_state(path, state)
 
@@ -562,7 +567,7 @@ class LabelList(Dataset):
         if isinstance(idxs, numbers.Integral):
             if self.item is None: x,y = self.x[idxs],self.y[idxs]
             else:                 x,y = self.item   ,0
-            if self.tfms:
+            if self.tfms or self.tfmargs:
                 x = x.apply_tfms(self.tfms, **self.tfmargs)
             if hasattr(self, 'tfms_y') and self.tfm_y and self.item is None:
                 y = y.apply_tfms(self.tfms_y, **{**self.tfmargs_y, 'do_resolve':False})
@@ -582,7 +587,7 @@ class LabelList(Dataset):
         "Return the minimal state for export."
         state = {'x_cls':self.x.__class__, 'x_proc':self.x.processor,
                  'y_cls':self.y.__class__, 'y_proc':self.y.processor,
-                 'path':self.path, 'tfms':self.tfms, 'tfm_y':self.tfm_y, 'tfmargs':self.tfmargs}
+                 'tfms':self.tfms, 'tfm_y':self.tfm_y, 'tfmargs':self.tfmargs}
         if hasattr(self, 'tfms_y'):    state['tfms_y']    = self.tfms_y
         if hasattr(self, 'tfmargs_y'): state['tfmargs_y'] = self.tfmargs_y
         return {**state, **kwargs}
@@ -592,14 +597,15 @@ class LabelList(Dataset):
         pickle.dump(self.get_state(**kwargs), open(fn, 'wb'))
 
     @classmethod
-    def load_empty(cls, fn:PathOrStr):
-        "Load the sate in `fn` to create an empty `LabelList` for inference."
-        return cls.load_state(pickle.load(open(fn, 'rb')))
+    def load_empty(cls, path:PathOrStr, fn:PathOrStr):
+        "Load the state in `fn` to create an empty `LabelList` for inference."
+        return cls.load_state(path, pickle.load(open(Path(path)/fn, 'rb')))
     
     @classmethod
-    def load_state(cls, state:dict):
-        x = state['x_cls']([], path=state['path'], processor=state['x_proc'], ignore_empty=True)
-        y = state['y_cls']([], path=state['path'], processor=state['y_proc'], ignore_empty=True)
+    def load_state(cls, path:PathOrStr, state:dict) -> 'LabelList':
+        "Create a `LabelList` from `state`."
+        x = state['x_cls']([], path=path, processor=state['x_proc'], ignore_empty=True)
+        y = state['y_cls']([], path=path, processor=state['y_proc'], ignore_empty=True)
         res = cls(x, y, tfms=state['tfms'], tfm_y=state['tfm_y'], **state['tfmargs']).process()
         if state.get('tfms_y', False):    res.tfms_y    = state['tfms_y']
         if state.get('tfmargs_y', False): res.tfmargs_y = state['tfmargs_y']
@@ -614,7 +620,7 @@ class LabelList(Dataset):
             if filt.sum()>0: 
                 #Warnings are given later since progress_bar might make them disappear.
                 self.warn = f"You are labelling your items with {self.y.__class__.__name__}.\n"
-                self.warn += f"Your {name} set contained the folowing unknown labels, the corresponding items have been discarded.\n"
+                self.warn += f"Your {name} set contained the following unknown labels, the corresponding items have been discarded.\n"
                 for p in self.y.processor:
                     if len(getattr(p, 'warns', [])) > 0: 
                         warnings = list(set(p.warns))
@@ -640,7 +646,7 @@ class LabelList(Dataset):
         return self
                 
     def databunch(self, **kwargs):
-        "To throw a clear error message when the data wasn't splitted."
+        "To throw a clear error message when the data wasn't split."
         raise Exception("Your data isn't split, if you don't want a validation set, please use `no_split`")
 
 @classmethod

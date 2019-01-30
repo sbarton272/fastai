@@ -15,10 +15,16 @@ def _default_split(m:nn.Module): return (m[1],)
 def _resnet_split(m:nn.Module): return (m[0][6],m[1])
 # Split squeezenet model on maxpool layers
 def _squeezenet_split(m:nn.Module): return (m[0][0][5], m[0][0][8], m[1])
+def _densenet_split(m:nn.Module): return (m[0][0][7],m[1])
+def _vgg_split(m:nn.Module): return (m[0][0][22],m[1])
+def _alexnet_split(m:nn.Module): return (m[0][0][6],m[1])
 
 _default_meta = {'cut':-1, 'split':_default_split}
 _resnet_meta  = {'cut':-2, 'split':_resnet_split }
 _squeezenet_meta = {'cut':-1, 'split': _squeezenet_split}
+_densenet_meta = {'cut':-1, 'split':_densenet_split}
+_vgg_meta = {'cut':-1, 'split':_vgg_split}
+_alexnet_meta = {'cut':-1, 'split':_alexnet_split}
 
 model_meta = {
     models.resnet18 :{**_resnet_meta}, models.resnet34: {**_resnet_meta},
@@ -26,7 +32,12 @@ model_meta = {
     models.resnet152:{**_resnet_meta},
 
     models.squeezenet1_0:{**_squeezenet_meta},
-    models.squeezenet1_1:{**_squeezenet_meta}}
+    models.squeezenet1_1:{**_squeezenet_meta},
+
+    models.densenet121:{**_densenet_meta}, models.densenet169:{**_densenet_meta},
+    models.densenet201:{**_densenet_meta}, models.densenet161:{**_densenet_meta},
+    models.vgg16_bn:{**_vgg_meta}, models.vgg19_bn:{**_vgg_meta},
+    models.alexnet:{**_alexnet_meta}}
 
 def cnn_config(arch):
     "Get the metadata associated with `arch`."
@@ -71,10 +82,10 @@ def create_cnn(data:DataBunch, arch:Callable, cut:Union[int,Callable]=None, pret
 def unet_learner(data:DataBunch, arch:Callable, pretrained:bool=True, blur_final:bool=True,
                  norm_type:Optional[NormType]=NormType, split_on:Optional[SplitFuncOrIdxList]=None, blur:bool=False,
                  self_attention:bool=False, y_range:Optional[Tuple[float,float]]=None, last_cross:bool=True,
-                 bottle:bool=False, **kwargs:Any)->None:
+                 bottle:bool=False, cut:Union[int,Callable]=None, **kwargs:Any)->None:
     "Build Unet learner from `data` and `arch`."
     meta = cnn_config(arch)
-    body = create_body(arch, pretrained)
+    body = create_body(arch, pretrained, cut)
     model = to_device(models.unet.DynamicUnet(body, n_classes=data.c, blur=blur, blur_final=blur_final,
           self_attention=self_attention, y_range=y_range, norm_type=norm_type, last_cross=last_cross,
           bottle=bottle), data.device)
@@ -112,6 +123,46 @@ class ClassificationInterpretation():
             cl = int(cl)
             im.show(ax=axes.flat[i], title=
                 f'{classes[self.pred_class[idx]]}/{classes[cl]} / {self.losses[idx]:.2f} / {self.probs[idx][cl]:.2f}')
+            
+    def plot_multi_top_losses(self, samples:int=3, figsz:Tuple[int,int]=(8,8), save_misclassified:bool=False):
+        "Show images in `top_losses` along with their prediction, actual, loss, and probability of predicted class in a multilabeled dataset."
+        if samples >20:
+            print("Max 20 samples")
+            return
+        losses, idxs = self.top_losses(self.data.c)
+        l_dim = len(losses.size())
+        if l_dim == 1: losses, idxs = self.top_losses()
+        infolist, ordlosses_idxs, mismatches_idxs, mismatches, losses_mismatches, mismatchescontainer = [],[],[],[],[],[]                                                      
+        truthlabels=np.asarray(self.y_true, dtype=int) 
+        classes_ids=[k for k in enumerate(self.data.classes)]
+        predclass=np.asarray(self.pred_class)
+        for i, pred in enumerate(predclass):
+            where_truth=np.nonzero((truthlabels[i]>0))[0]
+            mismatch=np.all(pred!=where_truth)
+            if mismatch: 
+                mismatches_idxs.append(i)
+                if l_dim > 1 : losses_mismatches.append((losses[i][pred],i))
+                else: losses_mismatches.append((losses[i],i))
+            if l_dim > 1: infotup=(i, pred, where_truth, losses[i][pred], np.round(self.probs[i], decimals=3)[pred], mismatch)
+            else: infotup=(i, pred, where_truth, losses[i], np.round(self.probs[i], decimals=3)[pred], mismatch)
+            infolist.append(infotup)
+        mismatches = self.data.valid_ds[mismatches_idxs]
+        ordlosses=sorted(losses_mismatches, key = lambda x: x[0], reverse=True)
+        for w in ordlosses: ordlosses_idxs.append(w[1])
+        mismatches_ordered_byloss=self.data.valid_ds[ordlosses_idxs]
+        print(str(len(mismatches))+' misclassified samples over '+str(len(self.data.valid_ds))+' samples in the validation set.')
+        for ima in range(len(mismatches_ordered_byloss)):
+            mismatchescontainer.append(mismatches_ordered_byloss[ima][0]) 
+        for sampleN in range(samples):
+            actualclasses=''
+            for clas in infolist[ordlosses_idxs[sampleN]][2]:
+                actualclasses=actualclasses+' -- '+str(classes_ids[clas][1])
+            imag=mismatches_ordered_byloss[sampleN][0]
+            imag=show_image(imag, figsize=figsz)
+            imag.set_title(f"""Predicted: {classes_ids[infolist[ordlosses_idxs[sampleN]][1]][1]} \nActual: {actualclasses}\nLoss: {infolist[ordlosses_idxs[sampleN]][3]}\nProbability: {infolist[ordlosses_idxs[sampleN]][4]}""",
+                           loc='left')
+            plt.show()
+            if save_misclassified: return mismatchescontainer
 
     def confusion_matrix(self, slice_size:int=None):
         "Confusion matrix as an `np.ndarray`."

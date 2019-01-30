@@ -27,6 +27,20 @@ def test_from_name_re(path):
     data = ImageDataBunch.from_name_re(path, fnames, pat, ds_tfms=(rand_pad(2, 28), []))
     mnist_tiny_sanity_test(data)
 
+def test_from_lists(path):
+    df = pd.read_csv(path/'labels.csv')
+    fnames = [path/f for f in df['name'].values]
+    labels = df['label'].values
+    data = ImageDataBunch.from_lists(path, fnames, labels)
+    mnist_tiny_sanity_test(data)
+    #Check labels weren't shuffled for the validation set
+    valid_fnames = data.valid_ds.x.items
+    pat = re.compile(r'/([^/]+)/\d+.png$')
+    expected_labels = [int(pat.search(str(o)).group(1)) for o in valid_fnames]
+    current_labels = [int(str(l)) for l in data.valid_ds.y]
+    assert len(expected_labels) == len(current_labels)
+    assert np.all(np.array(expected_labels) == np.array(current_labels))
+    
 def test_from_csv_and_from_df(path):
     for func in ['from_csv', 'from_df']:
         files = []
@@ -147,7 +161,7 @@ def test_vision_datasets():
 def test_multi():
     path = untar_data(URLs.PLANET_TINY)
     data = (ImageItemList.from_csv(path, 'labels.csv', folder='train', suffix='.jpg')
-        .random_split_by_pct(seed=42).label_from_df(sep=' ').databunch())
+        .random_split_by_pct(seed=42).label_from_df(label_delim=' ').databunch())
     x,y = data.valid_ds[0]
     assert x.shape[0]==3
     assert data.c==len(y.data)==14
@@ -228,7 +242,7 @@ def test_image_to_image_different_y_size():
     get_y_func = lambda o:o
     mnist = untar_data(URLs.MNIST_TINY)
     tfms = get_transforms()
-    data = (ImageItemList.from_folder(mnist)
+    data = (ImageImageList.from_folder(mnist)
             .random_split_by_pct()
             .label_from_func(get_y_func)
             .transform(tfms, size=20)
@@ -244,7 +258,7 @@ def test_image_to_image_different_tfms():
     x_tfms = get_transforms()
     y_tfms = [[t for t in x_tfms[0]], [t for t in x_tfms[1]]]
     y_tfms[0].append(flip_lr())
-    data = (ImageItemList.from_folder(mnist)
+    data = (ImageImageList.from_folder(mnist)
             .random_split_by_pct()
             .label_from_func(get_y_func)
             .transform(x_tfms)

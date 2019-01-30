@@ -212,7 +212,7 @@ have this notebook run quickly.</div>
 
 
 <div class="output_text output_subarea output_execute_result">
-<pre>(Category 3, tensor(0), tensor([0.9088, 0.0912]))</pre>
+<pre>(Category 3, tensor(0), tensor([0.9720, 0.0280]))</pre>
 </div>
 
 </div>
@@ -262,11 +262,11 @@ have this notebook run quickly.</div>
 
 
 <div class="output_text output_subarea output_execute_result">
-<pre>tensor([[0.9864, 0.0136],
-        [0.3572, 0.6428],
-        [0.9172, 0.0828],
-        [0.0053, 0.9947],
-        [0.9955, 0.0045]])</pre>
+<pre>tensor([[0.9639, 0.0361],
+        [0.0818, 0.9182],
+        [0.8819, 0.1181],
+        [0.0799, 0.9201],
+        [0.9878, 0.0122]])</pre>
 </div>
 
 </div>
@@ -316,7 +316,7 @@ have this notebook run quickly.</div>
     <div class="input_area">
 <div class=" highlight hl-ipython3"><pre><span></span><span class="n">data</span> <span class="o">=</span> <span class="p">(</span><span class="n">ImageItemList</span><span class="o">.</span><span class="n">from_csv</span><span class="p">(</span><span class="n">planet</span><span class="p">,</span> <span class="s1">&#39;labels.csv&#39;</span><span class="p">,</span> <span class="n">folder</span><span class="o">=</span><span class="s1">&#39;train&#39;</span><span class="p">,</span> <span class="n">suffix</span><span class="o">=</span><span class="s1">&#39;.jpg&#39;</span><span class="p">)</span>
         <span class="o">.</span><span class="n">random_split_by_pct</span><span class="p">()</span>
-        <span class="o">.</span><span class="n">label_from_df</span><span class="p">(</span><span class="n">sep</span><span class="o">=</span><span class="s1">&#39; &#39;</span><span class="p">)</span>
+        <span class="o">.</span><span class="n">label_from_df</span><span class="p">(</span><span class="n">label_delim</span><span class="o">=</span><span class="s1">&#39; &#39;</span><span class="p">)</span>
         <span class="o">.</span><span class="n">transform</span><span class="p">(</span><span class="n">planet_tfms</span><span class="p">,</span> <span class="n">size</span><span class="o">=</span><span class="mi">128</span><span class="p">)</span>
         <span class="o">.</span><span class="n">databunch</span><span class="p">()</span>
         <span class="o">.</span><span class="n">normalize</span><span class="p">(</span><span class="n">imagenet_stats</span><span class="p">))</span>

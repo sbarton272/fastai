@@ -13,44 +13,87 @@ TextMtd = IntEnum('TextMtd', 'DF TOK IDS')
 text_extensions = {'.txt'}
 
 class LanguageModelPreLoader(Callback):
-    "Transforms the texts in `dataset` in a stream for language modelling."
-    def __init__(self, dataset:LabelList, lengths:Collection[int]=None, bs:int=64, bptt:int=70, backwards:bool=False, 
-                 shuffle:bool=False, drop_last:bool=False):
-        self.dataset,self.bs,self.bptt,self.backwards = dataset,bs,bptt,backwards
-        self.shuffle,self.drop_last = shuffle,drop_last
-        self.lengths = np.array(ifnone(lengths, [len(o) for o in dataset.x.items]))
-        self.n = self.lengths.sum() // self.bs
-        
-    def __len__(self):
-        if self.item is not None:    return 1
-        if (self.n-1)%self.bptt == 0 or self.drop_last: return ((self.n-1) // self.bptt) * self.bs
-        return ((self.n-1) // self.bptt + 1) * self.bs
+    "Transforms the tokens in `dataset` to a stream of contiguous batches for language modelling."
     
+    class CircularIndex():
+        "Handles shuffle, direction of indexing, wraps around to head tail in the ragged array as needed"
+        def __init__(self, length:int, forward:bool): self.idx, self.forward = np.arange(length), forward
+        def __getitem__(self, i): 
+            return self.idx[ i%len(self.idx) if self.forward else len(self.idx)-1-i%len(self.idx)]
+        def __len__(self) -> int: return len(self.idx)
+        def shuffle(self): np.random.shuffle(self.idx)
+
+    def __init__(self, dataset:LabelList, lengths:Collection[int]=None, bs:int=32, bptt:int=70, backwards:bool=False, 
+                 shuffle:bool=False):
+        self.dataset,self.bs,self.bptt,self.shuffle,self.backwards,self.lengths = dataset,bs,bptt,shuffle,backwards,lengths
+        self.totalToks,self.ite_len,self.idx = int(0),None,None
+
+    def __len__(self): 
+        if self.ite_len is None:
+            if self.lengths is None: self.lengths = np.array([len(item) for item in self.dataset.x.items])
+            self.totalToks = self.lengths.sum()
+            self.ite_len   = self.bs*int( math.ceil( self.totalToks/(self.bptt*self.bs) )) if self.item is None else 1
+        return self.ite_len
+
     def __getattr__(self,k:str)->Any: return getattr(self.dataset, k)
-    
+   
+    def allocate_buffers(self):
+        "Create the ragged array that will be filled when we ask for items."
+        if self.ite_len is None: len(self)
+        self.idx   = LanguageModelPreLoader.CircularIndex(len(self.dataset.x.items), not self.backwards)
+        self.batch = np.zeros((self.bs, self.bptt+1), dtype=np.int64)
+        self.batch_x, self.batch_y = self.batch[:,0:self.bptt], self.batch[:,1:self.bptt+1] 
+        #ro: index of the text we're at inside our datasets for the various batches
+        self.ro    = np.zeros(self.bs, dtype=np.int64)
+        #ri: index of the token we're at inside our current text for the various batches
+        self.ri    = np.zeros(self.bs, dtype=np.int)
+
     def on_epoch_begin(self, **kwargs):
-        self.idxs = np.random.permutation(len(self.dataset)) if self.shuffle else arange_of(self.dataset)
-        self.text_idx = np.concatenate([[0],self.lengths[self.idxs].cumsum()])
+        if self.idx is None: self.allocate_buffers()
+        elif self.shuffle:   self.idx.shuffle()
+        self.idx.forward = not self.backwards 
+
+        step = self.totalToks / self.bs
+        ln_rag, countTokens, i_rag = 0, 0, -1
+        for i in range(0,self.bs):
+            #Compute the initial values for ro and ri 
+            while ln_rag + countTokens <= int(step * i):
+                countTokens += ln_rag
+                i_rag       += 1
+                ln_rag       = self.lengths[self.idx[i_rag]]
+            self.ro[i] = i_rag
+            self.ri[i] = ( ln_rag - int(step * i - countTokens) ) if self.backwards else int(step * i - countTokens)
         
     #Training dl gets on_epoch_begin called, val_dl, on_epoch_end
     def on_epoch_end(self, **kwargs): self.on_epoch_begin()
-    
+
     def __getitem__(self, k:int):
-        if self.item is not None: return self.dataset[0]
-        if not hasattr(self, 'idxs'): self.on_epoch_begin()
-        #The dataloader will send (batch_index) * bs + sample_index, converting to where to read in the stream 
-        read_idx = (k//self.bs) * self.bptt
-        i = read_idx  + (k % self.bs) * self.n 
-        seq_len = min(self.bptt, self.n-read_idx-1)
-        #Getting the indexes of the texts that start and finish the portion i---i+seq_len in the stream 
-        start,end = np.argmax(self.text_idx >= i)-1,np.argmin(self.text_idx <= i+seq_len+1)
-        start = max(0,start)
-        #Grabbing the texts we need in the dataset
-        if self.backwards: concat = np.concatenate([self.dataset.x.items[j][::-1] for j in self.idxs[start:end]])
-        else: concat = np.concatenate([self.dataset.x.items[j] for j in self.idxs[start:end]])
-        #Returning the right portion.
-        start_idx = i-self.text_idx[start]
-        return concat[start_idx:start_idx+seq_len], concat[start_idx+1:start_idx+seq_len+1]
+        j = k % self.bs
+        if j==0:
+            if self.item is not None: return self.dataset[0]
+            if self.idx is None: self.on_epoch_begin()
+        self.ro[j],self.ri[j] = self.fill_row(not self.backwards, self.dataset.x.items, self.idx, self.batch[j], 
+                                              self.ro[j], self.ri[j], overlap=1, lengths=self.lengths)
+        return self.batch_x[j], self.batch_y[j]
+
+    def fill_row(self, forward, items, idx, row, ro, ri, overlap,lengths):
+        "Fill the row with tokens from the ragged array. --OBS-- overlap != 1 has not been implemented"
+        ibuf = n = 0 
+        ro  -= 1
+        while ibuf < row.size:  
+            ro   += 1 
+            ix    = idx[ro]
+            rag   = items[ix]
+            if forward:
+                ri = 0 if ibuf else ri
+                n  = min(lengths[ix] - ri, row.size - ibuf)
+                row[ibuf:ibuf+n] = rag[ri:ri+n]
+            else:    
+                ri = lengths[ix] if ibuf else ri
+                n  = min(ri, row.size - ibuf) 
+                row[ibuf:ibuf+n] = rag[ri-n:ri][::-1]
+            ibuf += n
+        return ro, ri + ((n-overlap) if forward else -(n-overlap))
 
 class SortSampler(Sampler):
     "Go through the text data by order of length."
@@ -81,14 +124,17 @@ class SortishSampler(Sampler):
         sort_idx = np.concatenate((ck_idx[0], sort_idx))
         return iter(sort_idx)
 
-def pad_collate(samples:BatchSamples, pad_idx:int=1, pad_first:bool=True) -> Tuple[LongTensor, LongTensor]:
-    "Function that collect samples and adds padding."
+def pad_collate(samples:BatchSamples, pad_idx:int=1, pad_first:bool=True, backwards:bool=False) -> Tuple[LongTensor, LongTensor]:
+    "Function that collect samples and adds padding. Flips token order if needed"
     samples = to_data(samples)
     max_len = max([len(s[0]) for s in samples])
     res = torch.zeros(len(samples), max_len).long() + pad_idx
+    if backwards: pad_first = not pad_first
     for i,s in enumerate(samples):
         if pad_first: res[i,-len(s[0]):] = LongTensor(s[0])
         else:         res[i,:len(s[0]):] = LongTensor(s[0])
+    if backwards:
+        res = res.flip(1)
     return res, tensor(np.array([s[1] for s in samples]))
 
 def _get_processor(tokenizer:Tokenizer=None, vocab:Vocab=None, chunksize:int=10000, max_vocab:int=60000,
@@ -120,6 +166,7 @@ class TextDataBunch(DataBunch):
         src = ItemLists(path, TextList(train_ids, vocab, path=path, processor=[]),
                         TextList(valid_ids, vocab, path=path, processor=[]))
         src = src.label_for_lm() if cls==TextLMDataBunch else src.label_from_lists(train_lbls, valid_lbls, classes=classes, processor=[])
+        if not is1d(train_lbls): src.train.y.one_hot,src.valid.y.one_hot = True,True
         if test_ids is not None: src.add_test(TextList(test_ids, vocab, path=path), label=train_lbls[0])
         src.valid.x.processor = ifnone(processor, [TokenizeProcessor(), NumericalizeProcessor(vocab=vocab)])
         return src.databunch(**kwargs)
@@ -158,7 +205,8 @@ class TextDataBunch(DataBunch):
         if classes is None and is_listy(label_cols) and len(label_cols) > 1: classes = label_cols
         src = ItemLists(path, TextList.from_df(train_df, path, cols=text_cols, processor=processor),
                         TextList.from_df(valid_df, path, cols=text_cols, processor=processor))
-        src = src.label_for_lm() if cls==TextLMDataBunch else src.label_from_df(cols=label_cols, classes=classes, sep=label_delim)
+        if cls==TextLMDataBunch: src = src.label_for_lm() 
+        else: src = src.label_from_df(cols=label_cols, classes=classes, label_delim=label_delim)
         if test_df is not None: src.add_test(TextList.from_df(test_df, path, cols=text_cols))
         return src.databunch(**kwargs)
 
@@ -192,23 +240,23 @@ class TextLMDataBunch(TextDataBunch):
     "Create a `TextDataBunch` suitable for training a language model."
     @classmethod
     def create(cls, train_ds, valid_ds, test_ds=None, path:PathOrStr='.', no_check:bool=False, bs=64, num_workers:int=0,
-               device:torch.device=None, collate_fn:Callable=data_collate, tfms:Optional[Collection[Callable]]=None, 
+               device:torch.device=None, collate_fn:Callable=data_collate, dl_tfms:Optional[Collection[Callable]]=None, 
                **kwargs) -> DataBunch:
         "Create a `TextDataBunch` in `path` from the `datasets` for language modelling."
         datasets = cls._init_ds(train_ds, valid_ds, test_ds)
-        datasets = [LanguageModelPreLoader(ds, shuffle=(i==0), drop_last=(i==0), bs=bs, **kwargs) for i,ds in enumerate(datasets)]
+        datasets = [LanguageModelPreLoader(ds, shuffle=(i==0), bs=bs, **kwargs) for i,ds in enumerate(datasets)]
         val_bs = bs
         dls = [DataLoader(d, b, shuffle=False) for d,b in zip(datasets, (bs,val_bs,val_bs,val_bs)) if d is not None]
-        return cls(*dls, path=path, device=device, tfms=tfms, collate_fn=collate_fn, no_check=no_check)
+        return cls(*dls, path=path, device=device, dl_tfms=dl_tfms, collate_fn=collate_fn, no_check=no_check)
     
 class TextClasDataBunch(TextDataBunch):
     "Create a `TextDataBunch` suitable for training an RNN classifier."
     @classmethod
     def create(cls, train_ds, valid_ds, test_ds=None, path:PathOrStr='.', bs=64, pad_idx=1, pad_first=True,
-               no_check:bool=False, **kwargs) -> DataBunch:
+               no_check:bool=False, backwards:bool=False, **kwargs) -> DataBunch:
         "Function that transform the `datasets` in a `DataBunch` for classification."
         datasets = cls._init_ds(train_ds, valid_ds, test_ds)
-        collate_fn = partial(pad_collate, pad_idx=pad_idx, pad_first=pad_first)
+        collate_fn = partial(pad_collate, pad_idx=pad_idx, pad_first=pad_first, backwards=backwards)
         train_sampler = SortishSampler(datasets[0].x, key=lambda t: len(datasets[0][t][0].data), bs=bs//2)
         train_dl = DataLoader(datasets[0], batch_size=bs//2, sampler=train_sampler, drop_last=True, **kwargs)
         dataloaders = [train_dl]

@@ -1,6 +1,9 @@
 "NLP data processing; tokenizes text and creates vocab indexes"
 from ..torch_core import *
 
+import spacy
+from spacy.symbols import ORTH
+
 __all__ = ['BaseTokenizer', 'SpacyTokenizer', 'Tokenizer', 'Vocab', 'fix_html', 'replace_all_caps', 'replace_rep', 'replace_wrep',
            'rm_useless_spaces', 'spec_add_spaces', 'BOS', 'FLD', 'UNK', 'PAD', 'TK_MAJ', 'TK_UP', 'TK_REP', 'TK_REP', 'TK_WREP',
            'deal_caps']
@@ -116,7 +119,7 @@ class Tokenizer():
             return sum(e.map(self._process_all_1, partition_by_cores(texts, self.n_cpus)), [])
 
 class Vocab():
-    "Contain the correspondance between numbers and tokens and numericalize."
+    "Contain the correspondence between numbers and tokens and numericalize."
     def __init__(self, itos:Collection[str]):
         self.itos = itos
         self.stoi = collections.defaultdict(int,{v:k for k,v in enumerate(self.itos)})
@@ -145,4 +148,3 @@ class Vocab():
             if o in itos: itos.remove(o)
             itos.insert(0, o)
         return cls(itos)
-
